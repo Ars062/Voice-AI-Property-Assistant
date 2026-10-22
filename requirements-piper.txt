@@ -1,0 +1,5 @@
+# OPTIONAL: higher-quality Piper TTS.
+# The app automatically falls back to Windows SAPI when Piper is unavailable.
+# Install with:  pip install -r requirements-piper.txt
+# Then download a voice with:  python scripts/fetch_assets.py --piper
+piper-tts>=1.2

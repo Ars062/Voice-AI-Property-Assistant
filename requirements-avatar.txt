@@ -1,0 +1,9 @@
+# OPTIONAL: neural MuseTalk avatar engine (heavy, CPU-capable but slow).
+# The app runs fine without this; the default CPU avatar is `puppet`.
+# Install with:  pip install -r requirements-avatar.txt
+torch>=2.2
+torchvision>=0.17
+diffusers>=0.30
+transformers>=4.40
+einops>=0.7
+omegaconf>=2.3

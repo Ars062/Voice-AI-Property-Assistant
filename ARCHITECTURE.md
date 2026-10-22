@@ -1,114 +1,199 @@
-# Architecture & "What Each Part Is Actually Doing"
+# Architecture
 
-> Status: the FastAPI backend is **running locally** at `http://localhost:8001`
-> (started with `python app.py`). SQLite is seeded. The LangGraph agent,
-> LangChain tools and Faster-Whisper/Kokoro modules are wired in. The only
-> thing not yet exercised is the live voice path (needs LiveKit keys + mic).
-
----
-
-## 1. Big picture
+## 1. Components
 
 ```
-                         ┌──────────────────────────────────────────────┐
-   Browser / Streamlit   │                YOUR MACHINE                   │
-   (localhost:8501)      │                                              │
-        │  HTTP          │   FastAPI (:8001)  ──►  graph.run_agent()    │
-        ├───────────────►│        │                    │                │
-        │                │        │                    ▼                │
-        │                │        │            LangGraph state machine  │
-        │  ◄─────────────┤        │                    │                │
-        │   JSON reply   │        │                    ▼                │
-        │                │        │            LangChain tools (.invoke)│
-        │                │        │                    │                │
-        │                │        │                    ▼                │
-        │                │        │            SQLite (SQLAlchemy)      │
-        │                │        │                                     │
-   (Voice mode only)     │        │   Pipecat pipeline ─► LiveKit room   │
-        │  WebRTC        │        │     STT → agent → TTS               │
-        └───────────────►└────────┴────────────────────────────────────┘
+┌──────────────┐   HTTP    ┌──────────────────────────────────────────────┐
+│ Streamlit UI │ ────────► │ FastAPI (app.py)                             │
+│ text + mic   │           │  /chat /voice /stt /tts /rooms /health /meta │
+└──────────────┘           └───────┬──────────────────────┬───────────────┘
+                                   │                      │
+                     ┌─────────────▼──────────┐   ┌───────▼──────────────┐
+                     │ agent/                 │   │ voice/               │
+                     │ context (sessions)     │   │ stt (faster-whisper) │
+                     │ prompts (versioned)    │   │ tts (Piper / SAPI)   │
+                     │ guardrails             │   │ avatar (puppet /     │
+                     │ orchestrator           │   │         MuseTalk)    │
+                     └──────┬─────────┬───────┘   │ pipeline             │
+                            │         │           └──────────────────────┘
+                  plan JSON │         │ answer prompt
+                            ▼         ▼
+                     ┌──────────┐  ┌──────────┐
+                     │ Groq LLM │  │ property/│
+                     │ qwen     │  │ plan →   │
+                     └──────────┘  │ builder  │
+                                   │ validator│
+                                   │ repo     │
+                                   └────┬─────┘
+                                        │ SQL (parameterised)
+                              ┌─────────▼──────────┐
+                              │ PostgreSQL 16      │
+                              │ voice_readonly role│
+                              │ (read-only txn)    │
+                              └────────────────────┘
 ```
 
-The **same brain** (`graph.run_agent`) is used by both the text UI and the
-voice pipeline. Only the outer transport differs.
+## 2. Turn lifecycle (text)
 
----
+1. `POST /chat` validates the request and runs `VoicePipeline.process_text`
+   in a worker thread.
+2. `Assistant.handle` loads the session (`agent/context.py`), appends the user
+   turn and decides between the booking branch and the search branch.
+3. Search branch:
+   - `_extract_plan` asks Groq for JSON matching `PropertyQueryPlan`
+     (`property/query_plan.py`). Pydantic rejects wrong types, negative rent,
+     invalid sort keys, and `limit > QUERY_MAX_ROWS`.
+   - `_merge_plan` combines the new plan with the previous plan. Scalar fields
+     override only when present; amenities are unioned; a "cheapest/largest/
+     newest" hint overrides the sort; "start over"/"reset" drops history.
+   - `property/sql_builder.py` compiles the plan into a single `SELECT` with
+     bind parameters. No user text is interpolated into SQL; the only
+     interpolated strings are allow-listed column names and the sort clause.
+   - `property/repository.py` executes it on `DATABASE_READONLY_URL`.
+4. Answering:
+   - Broad searches (not a question) return a deterministic, counted summary so
+     the model cannot mis-state how many rooms matched.
+   - Specific questions go to the LLM with the exact records as JSON. The reply
+     is checked by `guardrails.grounding_issues`; if it mentions a price or room
+     id that is not in the records, it is discarded and the deterministic
+     summary is used instead.
+5. `VoicePipeline._finish` optionally synthesizes the reply and animates the
+   avatar, returning base64 WAV/GIF alongside the JSON.
 
-## 2. File-by-file: what it does and where it sits
+## 3. Why plan-to-SQL instead of text-to-SQL
 
-### Entry / config
-| File | Role | "Where it's doing its job" |
-|------|------|----------------------------|
-| `app.py` | FastAPI app + CLI. Exposes `/chat`, `/stt`, `/tts`, `/rooms`, `/token`. `python app.py` starts the server on `:8001`; `--voice` starts Pipecat; `--seed` seeds DB. | The **front door**. All HTTP requests land here. |
-| `config.py` | Loads `.env` into a `Settings` object (`LLM_PROVIDER`, DB URL, LiveKit keys, Whisper/Kokoro settings). | Read at import time by every other module. |
-| `llm.py` | `get_llm()` factory. Returns Groq (default) / OpenAI / Gemini / Ollama chat model. | Called whenever the agent needs to "think". |
-| `livekit_token.py` | `generate_token()` mints a LiveKit JWT for a client to join a room. | Called by `GET /token` for the voice client. |
-| `.env.example` | Template for secrets. Copy to `.env`. | Config source. |
+Text-to-SQL makes the model the security boundary. Here the model only chooses
+values for a fixed query shape. That gives:
 
-### Brain (agent)
-| File | Role | "Where it's doing its job" |
-|------|------|----------------------------|
-| `graph.py` | **LangGraph state machine.** Nodes: `greet → classify → (search/book/history/cancel/respond)`. Uses `MemorySaver` to remember state across turns (e.g. "waiting for confirmation"). `run_agent(text, thread_id)` runs one turn. | The **brain**. Receives text, decides intent, calls tools, returns reply. |
-| `prompts/hotel_agent.txt` | System prompt for the LLM (tone, rules, never invent prices). | Loaded by `graph.py` and used in every LLM call. |
-| `prompts/__init__.py` | Reads the txt file into `HOTEL_SYSTEM_PROMPT`. | Import helper. |
+- guaranteed parameterisation and a stable `EXPLAIN` plan;
+- a schema that cannot leak tables the model invents;
+- a small, testable validation surface;
+- deterministic follow-up behaviour independent of model quality.
 
-### Hands (tools / DB)
-| File | Role | "Where it's doing its job" |
-|------|------|----------------------------|
-| `tools/hotel_tools.py` | LangChain `@tool` functions: `search_rooms`, `check_price`, `book_room`, `cancel_booking`, `booking_history`. Each talks to SQLite. | Called **by the nodes in `graph.py`** to do real work. |
-| `tools/__init__.py` | Re-exports the tools. | Import helper. |
-| `database/models.py` | SQLAlchemy `Room` + `Booking` tables. | Defines the schema. |
-| `database/db.py` | `init_db()`, `seed_db()` (creates tables + sample data). | Runs on FastAPI startup and via `python app.py --seed`. |
+`property/validator.py` still exists for a future "advanced query" feature. It
+allows only `SELECT`/`WITH`, rejects comments and multiple statements, blocks
+DDL/DML and dangerous tokens (`pg_`, `information_schema`, `pg_catalog`), and
+requires every non-CTE table reference to be in `ALLOWED_TABLES`.
 
-### Voice (optional / not yet live)
-| File | Role | "Where it's doing its job" |
-|------|------|----------------------------|
-| `stt/faster_whisper.py` | `WhisperSTT` wrapper — audio file → transcript, runs locally. | Used by `POST /stt` and inside the Pipecat STT service. |
-| `tts/kokoro.py` | `KokoroTTS` — text → 24 kHz WAV, runs locally. | Used by `POST /tts` and inside the Pipecat TTS service. |
-| `pipecat_pipeline.py` | Builds the Pipecat frame pipeline: `LiveKit → FasterWhisper → HotelAgentProcessor → Kokoro → LiveKit`. `HotelAgentProcessor` is a custom node that calls `run_agent`. | Only active when you run `python app.py --voice` with LiveKit keys set. |
+## 4. Database and safety model
 
-### UI
-| File | Role | "Where it's doing its job" |
-|------|------|----------------------------|
-| `frontend/streamlit_app.py` | Text chat UI that calls `POST /chat` and shows room inventory from `GET /rooms`. | Runs separately on `localhost:8501`. |
+- `properties`, `rooms`, `amenities`, `room_amenities`, `policies`,
+  `bookings`, `room_blocks`.
+- `bookings_no_overlap` is a GiST exclusion constraint on
+  `(room_id WITH =, daterange(check_in, check_out, '[)') WITH &&)`
+  for confirmed bookings. Two concurrent requests for overlapping dates cannot
+  both commit.
+- `bookings.idempotency_key` is unique, so retrying a confirmed voice turn
+  returns the original booking instead of creating a second one.
+- `room_blocked_ranges` is a view exposing only date ranges (bookings + blocks),
+  with no guest PII. It is the only booking-derived object granted to
+  `voice_readonly`.
+- `voice_readonly` has `default_transaction_read_only=on`,
+  `statement_timeout=8s`, `idle_in_transaction_session_timeout=15s`, and no
+  `SELECT` on `bookings`.
+- `scripts/init_db.py` applies `sql/001_schema.sql`, `002_roles.sql`,
+  `003_seed.sql` in order; Docker applies the same files on first boot.
 
----
+## 5. Booking flow
 
-## 3. Runtime flows (what actually happens)
-
-### A. Text chat (working now)
-1. You type in Streamlit → `POST /chat {text, thread_id}` to FastAPI.
-2. `app.py` → `graph.run_agent(text)`.
-3. `graph.py`: `classify` node asks LLM for intent → routes to a node.
-4. That node calls a LangChain tool (e.g. `search_rooms.invoke(...)`).
-5. Tool reads/writes SQLite → returns text.
-6. LLM phrases a friendly reply → returned to FastAPI → Streamlit shows it.
-7. State saved in `MemorySaver` keyed by `thread_id`, so the next message
-   continues the same conversation (e.g. confirming a booking).
-
-### B. Voice chat (needs LiveKit keys + mic)
-1. Browser joins LiveKit room using token from `GET /token`.
-2. Your speech → LiveKit → Pipecat `FasterWhisperSTT` → text.
-3. `HotelAgentProcessor` → `run_agent(text)` (same brain as text).
-4. Reply text → Pipecat `KokoroTTSService` → audio → LiveKit → your ears.
-
----
-
-## 4. What is LIVE right now vs. what needs more
-- ✅ FastAPI backend on `:8001` (verified responding)
-- ✅ SQLite seeded, `/rooms` returns data
-- ✅ LangGraph + LangChain tools import and run (verified via smoke test)
-- ⚠️ `/chat` needs `GROQ_API_KEY` in `.env` to actually answer (LLM call)
-- ⏸️ Voice path needs `LIVEKIT_URL/API_KEY/API_SECRET` + `--voice` to run
-- ⏸️ Streamlit UI needs `pip install streamlit` + `streamlit run frontend/streamlit_app.py`
-
-## 5. How to bring the rest online
-```bash
-pip install -r requirements.txt
-cp .env.example .env          # fill GROQ_API_KEY (+ LiveKit keys for voice)
-python app.py --seed
-python app.py                 # backend :8001  (already running)
-streamlit run frontend/streamlit_app.py   # UI :8501
-# for voice:
-python app.py --voice
 ```
+user: "book the cheapest one for Jane Doe from 2027-03-01 to 2027-09-01"
+  → BOOKING_PROMPT extracts {room_id, guest_name, check_in, check_out}
+  → resolve room from the current result set (never from thin air)
+  → validate dates and availability
+  → pending_booking = {token, ...}  (no database write)
+  → "Please confirm: ... Reply yes to confirm."
+
+user: "yes"
+  → create_booking(..., idempotency_key=session:token)
+  → INSERT ... RETURNING
+  → exclusion constraint or unique key decides races
+  → "Booked. Your booking id is N ..."
+```
+
+Anything other than an explicit yes/no keeps the pending booking and asks for a
+clear confirmation. "No" clears it without writing.
+
+## 6. Voice stack
+
+### STT
+
+`voice/stt.py` wraps faster-whisper (`WhisperModel`, CPU, `int8`, VAD on,
+`beam_size=1`). Models download to `WHISPER_MODEL_DIR` on first use. Browser
+uploads (`webm/opus`) are decoded through PyAV; WAV is parsed with the standard
+library.
+
+### TTS
+
+`voice/tts.py` has two providers:
+
+- **SAPI** (default on Windows): renders through `System.Speech` in a PowerShell
+  subprocess. This avoids COM/thread issues that make `pyttsx3` unreliable in a
+  server process, and needs no download.
+- **Piper** (optional): ONNX neural voice, loaded lazily.
+
+`auto` picks Piper when its `.onnx` file exists and the package imports,
+otherwise SAPI.
+
+### Avatar
+
+Both engines share `voice/avatar/base.py` (`AvatarClip`, GIF encoding).
+
+- **puppet** (default): draws a portrait if `assets/portrait.png` is missing,
+  pre-renders 8 mouth shapes, and picks one per video frame from the smoothed
+  RMS of that frame's audio. It renders faster than real time.
+- **musetalk_cpu** (optional): the real MuseTalk 1.5 UNet + SD-VAE pipeline.
+
+## 7. CPU MuseTalk port
+
+`voice/avatar/musetalk_cpu.py` re-implements MuseTalk inference without
+`triton`, mmpose, face-parsing or librosa:
+
+1. whisper features are extracted for the utterance;
+2. features are reshaped into one prompt per rendered frame;
+3. the MuseTalk UNet denoises the cached portrait latents once per frame;
+4. SD-VAE decodes the lower-face crop, which is feathered back onto the portrait.
+
+CPU-specific changes:
+
+- device falls back to CPU and dtype to `float32` (float16 is GPU-only);
+- only `AVATAR_CPU_RENDER_FPS` unique frames are generated, then repeated to
+  `AVATAR_FPS` (e.g. 6 → 25) — the dominant cost saving;
+- optional int8 dynamic quantization of UNet `Linear` layers;
+- `torch.inference_mode()` everywhere, no autograd;
+- `AVATAR_CPU_THREADS` can pin `torch.set_num_threads`;
+- lazy imports so the core install never needs torch.
+
+Expected speed on a modern laptop CPU is roughly 1–3 s per generated frame, so
+`puppet` remains the interactive default. `AVATAR_MAX_SECONDS` caps the animated
+portion of a reply.
+
+## 8. Failure behaviour
+
+| Failure | Behaviour |
+| --- | --- |
+| Groq unreachable / rate limited | retries with backoff, then `503`; the API never fabricates an answer |
+| LLM returns invalid JSON | one repair attempt, then the previous plan (or empty plan) |
+| Answer mentions unknown data | discarded, deterministic records summary used |
+| Postgres down | `/health` → `503`, `/rooms` → `503`, `/chat` returns an LLM error only if the LLM fails |
+| STT failure/empty audio | friendly spoken prompt, `error=stt_failed` / `empty_transcript` |
+| TTS failure | text reply still returned, `speech_error` set |
+| Avatar failure | text/audio still returned, `avatar.available=false` with a reason |
+| Booking conflict | pending cleared, user asked to choose another room |
+| API restart | in-memory sessions are lost; the user starts a new conversation |
+
+## 9. Test matrix
+
+`tests/` covers:
+
+- guardrail classification, ordinal/cheapest selection, grounding checks;
+- plan validation, parameterisation, allow-listed SQL, blocked injections;
+- seeded inventory counts, city/rent/amenity filters, availability windows,
+  policies;
+- two-step booking, cancellation, missing details, idempotency, overlapping
+  conflict, back-to-back dates;
+- follow-up filter retention even when the model drops constraints;
+- WAV round-trip, resampling, puppet frames, GIF encoding;
+- API wiring, health, inventory, portrait, session reset;
+- repository-wide assertion that no OpenAI/LangChain imports or retired Groq
+  models are used.

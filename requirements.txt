@@ -1,18 +1,17 @@
-# Voice AI Property Assistant - runtime dependencies
-# Everything here runs on CPU. No CUDA/triton required.
+# Voice AI Property Assistant - CORE runtime (CPU only, no torch)
+# The avatar neural engine is optional: see requirements-avatar.txt.
 
 # --- Web / API -------------------------------------------------------------
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 python-multipart>=0.0.9
 websockets>=12.0
-streamlit>=1.37,<2.0
+streamlit>=1.40,<2.0
 requests>=2.31,<3.0
+httpx>=0.27,<1.0
 
-# --- LLM (Groq only) -------------------------------------------------------
+# --- LLM: Groq SDK directly (no OpenAI client) -----------------------------
 groq>=0.13,<1.0
-langchain-core>=0.3,<1.0
-langgraph>=0.2,<1.0
 pydantic>=2.7,<3.0
 pydantic-settings>=2.3,<3.0
 python-dotenv>=1.0,<2.0
@@ -21,19 +20,18 @@ python-dotenv>=1.0,<2.0
 SQLAlchemy>=2.0,<3.0
 psycopg[binary]>=3.1,<4.0
 
-# --- Voice: STT ------------------------------------------------------------
+# --- Voice: STT (local, CPU) ----------------------------------------------
 faster-whisper>=1.0,<2.0
+# faster-whisper pulls in PyAV, which decodes browser webm/opus uploads.
 
 # --- Voice: TTS ------------------------------------------------------------
-piper-tts>=1.2,<2.0
+# Default is Windows System.Speech via PowerShell (zero extra dependency).
+# Optional neural voice: pip install -r requirements-piper.txt
 
-# --- Voice: avatar (CPU lip-sync, optional) --------------------------------
-torch>=2.2
-torchvision>=0.17
+# --- Image / audio utilities ----------------------------------------------
 numpy>=1.24
 opencv-python-headless>=4.9
-diffusers>=0.30
-transformers>=4.40
-einops>=0.7
-omegaconf>=2.3
 pillow>=10.0
+
+# --- Tests -----------------------------------------------------------------
+pytest>=8.0,<9.0
