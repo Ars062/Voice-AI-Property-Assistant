@@ -163,5 +163,6 @@ The seed dataset is synthetic: 3 properties, 12 rooms, 10 amenities, 9 policies,
 - MuseTalk CPU speed depends heavily on the machine and is capped by `AVATAR_MAX_SECONDS`.
 
 See [SETUP.md](SETUP.md) for installation and troubleshooting,
-[ARCHITECTURE.md](ARCHITECTURE.md) for the design, and
-[AUDIT_REPORT.md](AUDIT_REPORT.md) for what was wrong with the legacy code.
+[ARCHITECTURE.md](ARCHITECTURE.md) for the design,
+[AUDIT_REPORT.md](AUDIT_REPORT.md) for what was wrong with the legacy code, and
+[docs/WRITEUP.md](docs/WRITEUP.md) for the full plan and implementation write-up.
